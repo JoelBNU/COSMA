@@ -1,156 +1,243 @@
+include:
+  - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v1/.cscs.yml'
+
 stages:
   - build
+  - allocate
   - test
+  - cleanup
+
+variables:
+  COSMA_GPU_MAX_TILE_K: 100
+  COSMA_GPU_MAX_TILE_M: 100
+  COSMA_GPU_MAX_TILE_N: 100
+  CRAY_CUDA_MPS: 1
+  GIT_SUBMODULE_STRATEGY: none
 
 ##
 ## BUILDS
 ##
-
-.kubernetes:
+.build_common:
+  extends: .dind
+  stage: build
+  only: ['master', 'staging', 'trying']
   variables:
-    DOCKER_DRIVER: overlay2
-    DOCKER_HOST: tcp://localhost:2375
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_BUILDKIT: 1
-    BUILDKIT_PROGRESS: plain
-
-  image: docker:stable
-  only:
-    - master
-    - staging
-    - trying
-  tags:
-    - kubernetes
-  services:
-    - docker:19.03.1-dind # Important to keep the patch version here!
+    GIT_SUBMODULE_STRATEGY: recursive
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
 
 # Builds a Docker image for the current commit, cpu / gpu
 build sanitizer cpu:
+  extends: .build_common
   variables:
-    GIT_SUBMODULE_STRATEGY: recursive
-  extends: .kubernetes
-  stage: build
-  before_script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-    - export BUILD_IMAGE=$CI_REGISTRY_IMAGE/build-env-asan:latest
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-cpu-asan:$CI_COMMIT_SHA
+    BUILD_IMAGE: $CI_REGISTRY_IMAGE/build-env-asan:latest
+    DEPLOY_IMAGE: $CI_REGISTRY_IMAGE/deploy-cpu-asan:$CI_COMMIT_SHA
   script:
     - docker build --network=host --cache-from $BUILD_IMAGE --build-arg BUILDKIT_INLINE_CACHE=1 -t $BUILD_IMAGE -f docker/asan/build-env.Dockerfile .
     - docker push $BUILD_IMAGE
-    - docker build -t $IMAGE --network=host --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg BUILD_ENV=$BUILD_IMAGE -f docker/asan/deploy.Dockerfile .
-    - docker push $IMAGE
+    - docker build -t $DEPLOY_IMAGE --network=host --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg BUILD_ENV=$BUILD_IMAGE -f docker/asan/deploy.Dockerfile .
+    - docker push $DEPLOY_IMAGE
 
 build cpu:
+  extends: .build_common
   variables:
-    GIT_SUBMODULE_STRATEGY: recursive
-  extends: .kubernetes
-  stage: build
-  before_script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-    - export BUILD_IMAGE=$CI_REGISTRY_IMAGE/build-env-cpu:latest
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-cpu:$CI_COMMIT_SHA
+    BUILD_IMAGE: $CI_REGISTRY_IMAGE/build-env-cpu:latest
+    DEPLOY_IMAGE: $CI_REGISTRY_IMAGE/deploy-cpu:$CI_COMMIT_SHA
   script:
     - docker build --network=host --cache-from $BUILD_IMAGE --build-arg BUILDKIT_INLINE_CACHE=1 -t $BUILD_IMAGE -f docker/cpu-release/build-env.Dockerfile .
     - docker push $BUILD_IMAGE
-    - docker build -t $IMAGE --network=host --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg BUILD_ENV=$BUILD_IMAGE -f docker/cpu-release/deploy.Dockerfile .
-    - docker push $IMAGE
+    - docker build -t $DEPLOY_IMAGE --network=host --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg BUILD_ENV=$BUILD_IMAGE -f docker/cpu-release/deploy.Dockerfile .
+    - docker push $DEPLOY_IMAGE
 
 build gpu:
+  extends: .build_common
   variables:
-    GIT_SUBMODULE_STRATEGY: recursive
-  extends: .kubernetes
-  stage: build
-  before_script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-    - export BUILD_IMAGE=$CI_REGISTRY_IMAGE/build-env-gpu:latest
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-gpu:$CI_COMMIT_SHA
+    BUILD_IMAGE: $CI_REGISTRY_IMAGE/build-env-gpu:latest
+    DEPLOY_IMAGE: $CI_REGISTRY_IMAGE/deploy-gpu:$CI_COMMIT_SHA
   script:
     - docker build --network=host --cache-from $BUILD_IMAGE --build-arg BUILDKIT_INLINE_CACHE=1 -t $BUILD_IMAGE -f docker/gpu/build-env.Dockerfile .
     - docker push $BUILD_IMAGE
-    - docker build -t $IMAGE --network=host --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg BUILD_ENV=$BUILD_IMAGE -f docker/gpu/deploy.Dockerfile .
-    - docker push $IMAGE
+    - docker build -t $DEPLOY_IMAGE --network=host --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg BUILD_ENV=$BUILD_IMAGE -f docker/gpu/deploy.Dockerfile .
+    - docker push $DEPLOY_IMAGE
 
 ##
 ## RUNS
 ##
 
-.daint-common:
+.test_common:
+  extends: .daint
+  stage: test
+  only: ['master', 'staging', 'trying']
+  resource_group: daint-job
   variables:
-    GIT_SUBMODULE_STRATEGY: none # no need to clone as we have images
-    CRAY_CUDA_MPS: 1
-    COSMA_GPU_MAX_TILE_M: 100
-    COSMA_GPU_MAX_TILE_N: 100
-    COSMA_GPU_MAX_TILE_K: 100
-  only:
-    - master
-    - staging
-    - trying
-  tags:
-    - daint
+    DISABLE_AFTER_SCRIPT: 'YES'
+    PULL_IMAGE: 'NO'
+    SLURM_TIMELIMIT: '15:00'
+    USE_MPI: 'YES'
+  script: nothing
 
-# Executes the docker images on Daint via Sarus
-test sanitizer cpu:
-  extends: .daint-common
-  stage: test
-  before_script:
-    - module load sarus daint-mc
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-cpu-asan:$CI_COMMIT_SHA
-    - sarus pull $IMAGE
-    - salloc --no-shell --job-name=cosma-ci-$CI_JOB_ID -N 2 -n 16 -C mc -p normal 
-    - export JOBID=$(squeue -h --name=cosma-ci-$CI_JOB_ID --format=%A)
+.cpu_sanitize:
+  extends: .test_common
+  image: $CI_REGISTRY_IMAGE/deploy-cpu-asan:$CI_COMMIT_SHA
+  variables:
+    ALLOCATION_NAME: cosma-test-sanitizer-cpu-$CI_PIPELINE_ID
+    SLURM_CONSTRAINT: mc
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_PARTITION: normal
+
+# TEST SANITIZER CPU
+allocate cpu sanitize:
+  stage: allocate
+  extends: .cpu_sanitize
+  variables:
+    GIT_STRATEGY: none
+    ONLY_ALLOCATE: 1
+    PULL_IMAGE: 'YES'
+
+pdgemm and multiply cpu sanitize:
+  extends: .cpu_sanitize
   script:
-    - srun --jobid=$JOBID -N 2 -n 16 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.pdgemm
-    - srun --jobid=$JOBID -N 2 -n 16 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.multiply
-    - srun --jobid=$JOBID -N 1 -n 1 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.mapper
-    - srun --jobid=$JOBID -N 1 -n 8 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.scalar_matmul
-    - srun --jobid=$JOBID -N 1 -n 4 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.multiply_using_layout
-  after_script:
-    - module load sarus
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-cpu-asan:$CI_COMMIT_SHA
-    - export JOBID=$(squeue -h --name=cosma-ci-$CI_JOB_ID --format=%A)
-    - scancel $JOBID
+    - test.pdgemm
+    - test.multiply
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 16
 
-test cpu:
-  extends: .daint-common
-  stage: test
-  before_script:
-    - module load sarus daint-mc
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-cpu:$CI_COMMIT_SHA
-    - sarus pull $IMAGE
-    - salloc --no-shell --job-name=cosma-ci-$CI_JOB_ID -N 2 -n 16 -C mc -p normal 
-    - export JOBID=$(squeue -h --name=cosma-ci-$CI_JOB_ID --format=%A)
+mapper cpu sanitize:
+  extends: .cpu_sanitize
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
+
+scalar_matmul cpu sanitize:
+  extends: .cpu_sanitize
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 8
+
+multiply_using_layout cpu sanitize:
+  extends: .cpu_sanitize
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 4
+
+deallocate cpu sanitize:
+  stage: cleanup
+  extends: .cpu_sanitize
+  variables:
+    ONLY_DEALLOCATE: 1
+    GIT_STRATEGY: none
+
+# TEST CPU
+.cpu:
+  extends: .test_common
+  image: $CI_REGISTRY_IMAGE/deploy-cpu:$CI_COMMIT_SHA
+  variables:
+    ALLOCATION_NAME: cosma-test-cpu-$CI_PIPELINE_ID
+    SLURM_CONSTRAINT: mc
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_PARTITION: normal
+
+allocate cpu:
+  stage: allocate
+  extends: .cpu
+  variables:
+    GIT_STRATEGY: none
+    ONLY_ALLOCATE: 1
+    PULL_IMAGE: 'YES'
+
+pdgemm and multiply cpu:
+  extends: .cpu
   script:
-    - srun --jobid=$JOBID -N 2 -n 16 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.pdgemm
-    - srun --jobid=$JOBID -N 2 -n 16 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.multiply
-    - srun --jobid=$JOBID -N 1 -n 1 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.mapper
-    - srun --jobid=$JOBID -N 1 -n 8 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.scalar_matmul
-    - srun --jobid=$JOBID -N 1 -n 4 -C mc -p normal unbuffer sarus run -t --mpi $IMAGE test.multiply_using_layout
-  after_script:
-    - module load sarus
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-cpu:$CI_COMMIT_SHA
-    - export JOBID=$(squeue -h --name=cosma-ci-$CI_JOB_ID --format=%A)
-    - scancel $JOBID
-    - sarus rmi $IMAGE
+    - test.pdgemm
+    - test.multiply
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 16
 
-test gpu:
-  extends: .daint-common
-  stage: test
-  before_script:
-    - module load sarus daint-gpu
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-gpu:$CI_COMMIT_SHA
-    - sarus pull $IMAGE
-    - salloc --no-shell --job-name=cosma-ci-$CI_JOB_ID -N 2 -n 16 -C gpu -p normal 
-    - export JOBID=$(squeue -h --name=cosma-ci-$CI_JOB_ID --format=%A)
+mapper cpu:
+  extends: .cpu
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
+
+scalar_matmul cpu:
+  extends: .cpu
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 8
+
+multiply_using_layout cpu:
+  extends: .cpu
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 4
+
+deallocate cpu:
+  stage: cleanup
+  extends: .cpu
+  variables:
+    ONLY_DEALLOCATE: 1
+    GIT_STRATEGY: none
+
+# TEST GPU
+.gpu:
+  extends: .test_common
+  image: $CI_REGISTRY_IMAGE/deploy-gpu:$CI_COMMIT_SHA
+  variables:
+    ALLOCATION_NAME: cosma-test-gpu-$CI_PIPELINE_ID
+    SLURM_CONSTRAINT: gpu
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_PARTITION: normal
+
+allocate gpu:
+  stage: allocate
+  extends: .gpu
+  variables:
+    ONLY_ALLOCATE: 1
+    PULL_IMAGE: 'YES'
+    GIT_STRATEGY: none
+
+pdgemm and multiply gpu:
+  extends: .test_common
   script:
-    - srun --jobid=$JOBID -N 2 -n 16 -C gpu -p normal unbuffer sarus run -t --mpi $IMAGE test.pdgemm
-    - srun --jobid=$JOBID -N 2 -n 16 -C gpu -p normal unbuffer sarus run -t --mpi $IMAGE test.multiply
-    - srun --jobid=$JOBID -N 1 -n 1 -C gpu -p normal unbuffer sarus run -t --mpi $IMAGE test.mapper
-    - srun --jobid=$JOBID -N 1 -n 8 -C gpu -p normal unbuffer sarus run -t --mpi $IMAGE test.scalar_matmul
-    - srun --jobid=$JOBID -N 1 -n 4 -C gpu -p normal unbuffer sarus run -t --mpi $IMAGE test.multiply_using_layout
-  after_script:
-    - module load sarus
-    - export IMAGE=$CI_REGISTRY_IMAGE/deploy-gpu:$CI_COMMIT_SHA
-    - export JOBID=$(squeue -h --name=cosma-ci-$CI_JOB_ID --format=%A)
-    - scancel $JOBID
-    - sarus rmi $IMAGE
+    - test.pdgemm
+    - test.multiply
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 16
 
+mapper gpu:
+  extends: .test_common
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
+
+scalar_matmul gpu:
+  extends: .test_common
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 8
+
+multiply_using_layout gpu:
+  extends: .test_common
+  script: test.mapper
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 4
+
+deallocate gpu:
+  stage: cleanup
+  extends: .daint_dealloc
+  variables:
+    GIT_STRATEGY: none
+    ONLY_DEALLOCATE: 1
+    
