@@ -62,7 +62,6 @@ cpu test:
 
 gpu test:
   stage: test
-  extends: .run_common
   only: ['master', 'staging', 'trying']
   trigger:
     include: /ci/gpu.yml
