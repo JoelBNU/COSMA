@@ -1,5 +1,4 @@
 include:
-  - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.cscs.yml'
   - local: /ci/test.yml
 
 image: $CI_REGISTRY_IMAGE/deploy-cpu:$CI_COMMIT_SHA
